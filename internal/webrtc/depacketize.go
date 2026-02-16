@@ -4,7 +4,9 @@ package webrtc
 // It maintains instance state for FU-A fragment reassembly,
 // preventing corruption when multiple streams are active.
 type H264Depacketizer struct {
-	fuaBuf []byte
+	fuaBuf      []byte
+	fuaStarted  bool
+	expectedSeq uint16
 }
 
 // NewH264Depacketizer creates a new depacketizer with its own reassembly buffer.
@@ -14,7 +16,7 @@ func NewH264Depacketizer() *H264Depacketizer {
 
 // Depacketize extracts NAL units from an RTP H264 payload.
 // Handles single NAL, STAP-A, and FU-A packet types.
-func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
+func (d *H264Depacketizer) Depacketize(sequenceNumber uint16, payload []byte) [][]byte {
 	if len(payload) < 1 {
 		return nil
 	}
@@ -29,7 +31,7 @@ func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 		return d.depacketizeSTAPA(payload)
 
 	case naluType == 28:
-		return d.depacketizeFUA(payload)
+		return d.depacketizeFUA(sequenceNumber, payload)
 
 	default:
 		return nil
@@ -43,6 +45,9 @@ func (d *H264Depacketizer) depacketizeSTAPA(payload []byte) [][]byte {
 	for offset+2 <= len(payload) {
 		size := int(payload[offset])<<8 | int(payload[offset+1])
 		offset += 2
+		if size == 0 {
+			break
+		}
 		if offset+size > len(payload) {
 			break
 		}
@@ -52,7 +57,7 @@ func (d *H264Depacketizer) depacketizeSTAPA(payload []byte) [][]byte {
 	return nalus
 }
 
-func (d *H264Depacketizer) depacketizeFUA(payload []byte) [][]byte {
+func (d *H264Depacketizer) depacketizeFUA(sequenceNumber uint16, payload []byte) [][]byte {
 	if len(payload) < 2 {
 		return nil
 	}
@@ -66,14 +71,38 @@ func (d *H264Depacketizer) depacketizeFUA(payload []byte) [][]byte {
 	if start {
 		// Reconstruct NAL header: F+NRI from FU indicator + type from FU header
 		d.fuaBuf = []byte{fnri | naluType}
+		d.fuaStarted = true
+		d.expectedSeq = sequenceNumber + 1
 		d.fuaBuf = append(d.fuaBuf, payload[2:]...)
-	} else {
-		d.fuaBuf = append(d.fuaBuf, payload[2:]...)
+
+		if end {
+			nalu := d.fuaBuf
+			d.fuaBuf = nil
+			d.fuaStarted = false
+			return [][]byte{nalu}
+		}
+		return nil
 	}
+
+	// Drop orphan middle/end fragments.
+	if !d.fuaStarted {
+		return nil
+	}
+
+	// Sequence discontinuity means a missing/reordered fragment. Drop this NAL.
+	if sequenceNumber != d.expectedSeq {
+		d.fuaBuf = nil
+		d.fuaStarted = false
+		return nil
+	}
+
+	d.expectedSeq = sequenceNumber + 1
+	d.fuaBuf = append(d.fuaBuf, payload[2:]...)
 
 	if end {
 		nalu := d.fuaBuf
 		d.fuaBuf = nil
+		d.fuaStarted = false
 		return [][]byte{nalu}
 	}
 

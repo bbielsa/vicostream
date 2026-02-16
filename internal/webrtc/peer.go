@@ -12,7 +12,6 @@ import (
 	"vico_home/native/internal/domain"
 
 	"github.com/pion/interceptor"
-	"github.com/pion/interceptor/pkg/nack"
 	pion "github.com/pion/webrtc/v4"
 )
 
@@ -53,11 +52,9 @@ func NewPeer(iceServers []domain.ICEServer, serialNumber string) (*Peer, error) 
 	}
 
 	i := &interceptor.Registry{}
-	responderFactory, err := nack.NewResponderInterceptor()
-	if err != nil {
-		return nil, fmt.Errorf("create nack responder: %w", err)
+	if err := pion.RegisterDefaultInterceptors(m, i); err != nil {
+		return nil, fmt.Errorf("register default interceptors: %w", err)
 	}
-	i.Add(responderFactory)
 
 	api := pion.NewAPI(
 		pion.WithMediaEngine(m),
@@ -169,13 +166,19 @@ func (p *Peer) readVideoTrack(track *pion.TrackRemote, w io.Writer) {
 			return
 		}
 
-		nalus := depack.Depacketize(pkt.Payload)
+		nalus := depack.Depacketize(pkt.SequenceNumber, pkt.Payload)
 		for _, nalu := range nalus {
 			if len(nalu) == 0 {
 				continue
 			}
-			w.Write(startCode)
-			w.Write(nalu)
+			if _, err := w.Write(startCode); err != nil {
+				log.Printf("[webrtc] video write start code error: %v", err)
+				return
+			}
+			if _, err := w.Write(nalu); err != nil {
+				log.Printf("[webrtc] video write nalu error: %v", err)
+				return
+			}
 		}
 	}
 }
